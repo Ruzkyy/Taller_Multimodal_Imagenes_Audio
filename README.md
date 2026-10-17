@@ -1,0 +1,361 @@
+# De las *tools* a un RAG con *tools*
+
+Este proyecto enseña en tres pasos cómo un LLM puede usar herramientas (*tools*) y cómo aplicarlo a un asistente que responde preguntas sobre reglamentos institucionales en PDF con **RAG** (*Retrieval-Augmented Generation*):
+
+| Paso | Archivo | Qué muestra |
+|---|---|---|
+| 1 | [tools.py](tools.py) | Qué es una *tool*, con un ejemplo sencillo: calcular una nota final. |
+| 2 | [rag_basico.py](rag_basico.py) | RAG clásico: **siempre** busca en la base vectorial y mete el resultado en el prompt. |
+| 3 | [rag_con_tools.py](rag_con_tools.py) | RAG con *tools*: la búsqueda es una **herramienta** y **el LLM decide** cuándo y cómo usarla. |
+
+---
+
+## 1. Estructura del proyecto
+
+```
+RAG/
+├── pdfs/                  # Documentos fuente (reglamentos)
+├── db/                    # Base vectorial ChromaDB (se genera automáticamente)
+├── utils/
+│   ├── load_documents.py  # cargar_pdfs()              → lee los PDFs (un Document por página)
+│   ├── chunking.py        # crear_chunks()             → divide las páginas en fragmentos
+│   ├── embeddings.py      # cargar_modelo_embeddings() → modelo de embeddings (Hugging Face)
+│   ├── store_vector.py    # crear_vector_store()       → indexa los chunks en ChromaDB
+│   ├── retrieval.py       # cargar_vector_store(), recuperar_chunks() → búsqueda semántica
+│   └── load_model.py      # cargar_llm()               → LLM de Groq
+├── tools.py               # Paso 1: introducción a las tools
+├── rag_basico.py          # Paso 2: RAG sin tools
+├── rag_con_tools.py       # Paso 3: RAG con tools
+└── .env                   # Configuración y claves (no se sube a git)
+```
+
+Los dos scripts de RAG comparten las mismas piezas de `utils/`. **Solo cambia la forma de conectar la búsqueda con el LLM.**
+
+---
+
+## 2. ¿Qué es una *tool*? Ejemplo con `tools.py`
+
+Un LLM solo genera texto: no puede ejecutar código, hacer cálculos exactos ni consultar una base de datos. Una *tool* (herramienta) es una **función de Python que el LLM puede pedir que se ejecute**.
+
+El reparto de trabajo es este:
+- **El LLM decide** qué herramienta usar y con qué argumentos.
+- **Tu programa la ejecuta** y le devuelve el resultado.
+
+### 2.1 Definir la tool
+
+Se crea con el decorador `@tool` de LangChain:
+
+```python
+from langchain_core.tools import tool
+
+@tool("nota_final_kl")
+def nota_final_kl(parcial1: float, parcial2: float) -> float:
+    """Calcula la nota final de un estudiante según la fórmula de la Konrad Lorenz:
+    40% del primer parcial y 60% del segundo parcial.
+
+    Args:
+        parcial1: nota del primer parcial (de 0 a 50).
+        parcial2: nota del segundo parcial (de 0 a 50).
+    """
+    return parcial1 * 0.4 + parcial2 * 0.6
+```
+
+El LLM **nunca ve el código** de la función. Solo recibe esta descripción, que LangChain genera a partir del nombre, el docstring y los parámetros:
+
+```json
+{
+  "title": "nota_final_kl",
+  "description": "Calcula la nota final de un estudiante según la fórmula de la Konrad Lorenz: 40% del primer parcial y 60% del segundo parcial. ...",
+  "properties": {
+    "parcial1": {"type": "number"},
+    "parcial2": {"type": "number"}
+  },
+  "required": ["parcial1", "parcial2"]
+}
+```
+
+De ahí salen tres reglas para escribir buenas tools:
+
+1. **El docstring es la instrucción de uso.** Es lo único que el modelo lee para decidir si la herramienta le sirve, así que debe decir con claridad **qué hace** y **cuándo usarla**.
+2. **Los parámetros deben tener nombres descriptivos.** Con `parcial1` y `parcial2`, el LLM sabe dónde va cada nota. Con nombres como `x` e `y` tendría que adivinarlo.
+3. **El nombre que ve el LLM es el del decorador**, no el de la variable de Python. Si se escribe `@tool("nota_final_kl")` sobre `def tool1(...)`, para el modelo la herramienta se llama `nota_final_kl` y `tool1` no existe. Pedirle *"usa la tool1"* lo confunde. Lo más sencillo es usar el mismo nombre en los dos sitios, o no nombrar la tool en la pregunta y dejar que el LLM la elija por su descripción.
+
+### 2.2 Probar la tool sin LLM
+
+Una tool sigue siendo una función normal. Antes de dársela al LLM, conviene probarla directamente con `invoke`:
+
+```python
+nota_final = nota_final_kl.invoke({"parcial1": 3.5, "parcial2": 4.0})
+print(f"Nota final: {nota_final}")   # Nota final: 3.8
+```
+
+### 2.3 Dársela al LLM con `bind_tools`
+
+`bind_tools` envía al LLM la descripción de las herramientas disponibles:
+
+```python
+llm_model_con_tools = cargar_llm().bind_tools([nota_final_kl])
+```
+
+### 2.4 El ciclo completo: petición, ejecución y respuesta
+
+`tools.py` sigue tres pasos:
+
+```python
+# 1. Enviar la pregunta: el LLM responde pidiendo la tool (tool_calls)
+mensajes = [HumanMessage(pregunta_tool)]
+respuesta_tool = llm_model_con_tools.invoke(mensajes)
+mensajes.append(respuesta_tool)  # la petición del LLM debe quedar en el historial
+
+# 2. Ejecutar cada tool pedida y devolver el resultado con un ToolMessage
+for tool_call in respuesta_tool.tool_calls:
+    resultado = nota_final_kl.invoke(tool_call["args"])
+    mensajes.append(ToolMessage(content=str(resultado), tool_call_id=tool_call["id"]))
+
+# 3. Volver a llamar al LLM con el resultado para que redacte la respuesta final
+respuesta_final = llm_model_con_tools.invoke(mensajes)
+```
+
+**Paso 1: el LLM pide la herramienta.** Cuando decide usar una tool, el LLM no responde con texto: `content` llega vacío y la petición viene en el atributo **`tool_calls`**, que es una lista:
+
+```python
+respuesta_tool.tool_calls
+# [{'name': 'nota_final_kl',                        # qué tool quiere usar
+#   'args': {'parcial1': 3.5, 'parcial2': 4},       # con qué argumentos
+#   'id':   'fc_6854174e-...'}]                     # identificador de la petición
+```
+
+Fíjate en que **el LLM extrajo los argumentos de la pregunta**. El usuario escribió *"obtuvo 3.5 en el primer parcial y 4.0 en el segundo"*, y el modelo lo convirtió en `parcial1=3.5` y `parcial2=4`.
+
+**Paso 2: el programa ejecuta la tool y devuelve el resultado.** El resultado se envía en un **`ToolMessage`**, con dos condiciones:
+- Debe llevar **el mismo `id`** de la petición (`tool_call_id`), para que el LLM sepa a qué petición responde.
+- Su contenido debe ser **texto**. Por eso el código usa `str(resultado)`.
+
+**Paso 3: el LLM redacta la respuesta.** Ahora el historial contiene la pregunta, la petición y el resultado, y con eso el LLM escribe la respuesta final.
+
+Salida real de `python tools.py`:
+
+```
+Petición del LLM:     [{'name': 'nota_final_kl', 'args': {'parcial1': 3.5, 'parcial2': 4}, 'id': 'fc_6854...'}]
+Resultado de la tool: 3.8
+Respuesta final:      Para calcular la nota final según la fórmula de la Konrad Lorenz
+                      (40 % del primer parcial y 60 % del segundo parcial): ... = 1.4 + 2.4 = 3.8
+```
+
+> **¿Por qué no deja que el LLM haga la cuenta?** Los LLM pueden equivocarse en cálculos y no conocen las reglas propias de una institución. Con la tool, la fórmula la aplica el código, que siempre da el resultado exacto, y el LLM solo se encarga de entender la pregunta y redactar la respuesta.
+
+### 2.5 La idea clave
+
+```
+pregunta ──► LLM ──► tool_calls ──► tu código ejecuta la tool ──► ToolMessage ──► LLM ──► respuesta
+```
+
+Este mismo patrón sirve para cualquier herramienta. En la sección 4 se aplica a la búsqueda en los reglamentos.
+
+---
+
+## 3. RAG sin tools: `rag_basico.py`
+
+### Cómo funciona
+
+Para **cada** pregunta, el programa sigue siempre los mismos pasos:
+
+```
+pregunta ──► recuperar_chunks(pregunta, k=5) ──► contexto ──► PROMPT_TEMPLATE ──► LLM ──► respuesta
+```
+
+```python
+resultados   = recuperar_chunks(vector_store, pregunta, k=5)          # 1. buscar (siempre)
+contexto     = context(resultados)                                    # 2. unir los chunks
+prompt_final = PROMPT_TEMPLATE.format(context=contexto, question=pregunta)  # 3. armar el prompt
+respuesta    = llm_model.invoke(prompt_final)                         # 4. preguntar al LLM
+```
+
+El LLM no toma ninguna decisión: recibe un texto ya armado y lo completa. **El flujo lo decide el programador, no el modelo.**
+
+### Desventajas
+
+1. **Busca siempre, aunque no haga falta.**
+   Si el usuario escribe *"Hola"* o *"Gracias"*, igualmente se recuperan 5 chunks y se envían al LLM. Esto gasta *tokens* y tiempo, y el modelo puede responder un saludo con información de reglamentos que nadie pidió.
+
+2. **La búsqueda usa la pregunta literal.**
+   La consulta a la base vectorial es exactamente lo que escribió el usuario, con muletillas, errores o redacción ambigua incluidos. Por ejemplo, *"Oye, ¿qué me pasa si llego tarde varias veces?"* se busca tal cual, cuando una consulta como *"sanciones por retrasos reiterados"* encontraría mejores fragmentos.
+
+3. **Una sola búsqueda por pregunta.**
+   Si la pregunta tiene varias partes (*"¿Cuáles son los deberes del trabajador y qué sanciones hay si no los cumple?"*), los 5 chunks recuperados con una sola búsqueda tienen que cubrir los dos temas, y suelen quedarse cortos en uno de ellos.
+
+4. **No hay segunda oportunidad.**
+   Si los chunks recuperados no sirven, el LLM no puede pedir más información. Solo le queda responder con lo que tiene o decir que no encontró nada.
+
+5. **Difícil de ampliar.**
+   Para añadir otra capacidad, como calcular una nota con `nota_final_kl`, habría que programar a mano un `if` que decida cuándo usarla según la pregunta.
+
+6. **Reindexa en cada ejecución.**
+   Cada vez que se arranca, vuelve a leer todos los PDFs y recrea la base vectorial (`reset=True`), aunque nada haya cambiado. Esta desventaja no tiene que ver con las *tools*, pero también se corrige en la nueva versión.
+
+---
+
+## 4. Conectar las tools con el RAG: `rag_con_tools.py`
+
+### La búsqueda se convierte en una tool
+
+Es el mismo patrón de `nota_final_kl`. La diferencia es que, en lugar de una fórmula, la función busca en la base vectorial:
+
+```python
+@tool
+def buscar_reglamentos(consulta: str) -> str:
+    """Busca en los reglamentos institucionales fragmentos relevantes para la consulta.
+    Úsala siempre que la pregunta trate sobre normas, derechos, deberes, sanciones o procedimientos."""
+    resultados = recuperar_chunks(vector_store, consulta, k=5, verbose=False)
+    return context(resultados)
+```
+
+| | `tools.py` | `rag_con_tools.py` |
+|---|---|---|
+| Tool | `nota_final_kl(parcial1, parcial2)` | `buscar_reglamentos(consulta)` |
+| Qué hace | Aplica una fórmula | Busca chunks en ChromaDB |
+| Argumentos que elige el LLM | Las notas, extraídas de la pregunta | El texto de búsqueda, redactado por el propio LLM |
+| Resultado | Un número | Los fragmentos con su fuente y página |
+
+Las funciones `recuperar_chunks()` y `context()` son **las mismas** que en `rag_basico.py`. La búsqueda no cambia; lo que cambia es **quién decide cuándo hacerla y con qué texto**.
+
+Hay un detalle técnico: la tool se define dentro de la función `crear_tools(vector_store)`, para que tenga acceso a la base vectorial sin usar variables globales.
+
+### Del ciclo de una ronda al bucle
+
+`tools.py` hace **una sola ronda**: petición, ejecución y respuesta. En un RAG, el LLM puede necesitar varias rondas, por ejemplo para buscar dos temas por separado o volver a buscar si el primer resultado no le sirvió. Por eso `rag_con_tools.py` repite los mismos tres pasos dentro de un bucle, en la función `responder()`:
+
+```python
+mensajes = [SystemMessage(SYSTEM_PROMPT), HumanMessage(pregunta)]
+
+for _ in range(MAX_ITERACIONES):
+    respuesta = llm_con_tools.invoke(mensajes)
+    mensajes.append(respuesta)                        # guardar la petición del LLM en el historial
+
+    if not respuesta.tool_calls:                      # sin peticiones → respuesta final
+        return respuesta.content
+
+    for tool_call in respuesta.tool_calls:            # puede pedir varias tools en la misma ronda
+        herramienta = tools_por_nombre[tool_call["name"]]
+        resultado = herramienta.invoke(tool_call["args"])
+        mensajes.append(ToolMessage(content=resultado, tool_call_id=tool_call["id"]))
+```
+
+```
+pregunta ──► LLM ──┬──► ¿pide una tool? NO ──► respuesta final
+                   │
+                   └──► SÍ ──► el programa ejecuta la tool ──► ToolMessage ──► LLM ──► (se repite)
+```
+
+Diferencias con `tools.py`:
+
+- **La condición de salida es `tool_calls` vacío.** Si el LLM no pide nada, su mensaje es la respuesta final. Así, un saludo se responde en la primera ronda sin buscar.
+- **`tools_por_nombre`** es un diccionario `{nombre: tool}` para ejecutar la herramienta que pida el LLM. En `tools.py` había una sola y se llamaba directamente.
+- **`MAX_ITERACIONES`** (5) permite varias rondas, pero evita bucles infinitos si el modelo se queda pidiendo herramientas.
+- **Hay un `SystemMessage`** con las reglas del asistente: usar la herramienta para las preguntas sobre reglamentos, responder solo con lo recuperado y citar la fuente y la página. A diferencia de `rag_basico.py`, el prompt no lleva `{context}`, porque el contexto llega en el `ToolMessage` y solo cuando el LLM lo pide.
+
+### Ejemplo real de ejecución
+
+```
+Pregunta (o 'salir' para terminar): Hola, ¿cómo estás?
+
+Respuesta: ¡Hola! Estoy bien, gracias. ¿En qué puedo ayudarte hoy?
+
+Pregunta (o 'salir' para terminar): ¿Cuáles son las sanciones por llegar tarde?
+  [tool] buscar_reglamentos({'consulta': 'sanciones por llegar tarde'})
+
+Respuesta: Las sanciones por llegar tarde (retrasos sin excusa suficiente) están
+establecidas en el Reglamento Interno de Trabajo:
+1. Primera falta – Llamado de atención por escrito con copia a la hoja de vida. (Fuente: ...)
+2. Segunda falta – Suspensión en el trabajo hasta por dos días, sin remuneración. (Fuente: ...)
+...
+```
+
+- En el saludo, el LLM **no usó la herramienta**.
+- En la pregunta sobre sanciones, el LLM **redactó su propia consulta**: *"sanciones por llegar tarde"*.
+
+La línea `[tool] ...` se imprime en consola para poder ver cuándo y con qué argumentos decide buscar el modelo.
+
+---
+
+## 5. Comparación: qué se corrige con las tools
+
+| Desventaja de `rag_basico.py` | Cómo se resuelve en `rag_con_tools.py` |
+|---|---|
+| Busca siempre, incluso en un saludo. | El LLM decide si necesita buscar. Un *"Hola"* se responde sin consultar la base. |
+| Busca con la pregunta literal del usuario. | El LLM **reformula** la consulta (el argumento `consulta`) para encontrar mejores fragmentos. |
+| Una sola búsqueda por pregunta. | El LLM puede llamar a la herramienta **varias veces**, por ejemplo una por cada parte de una pregunta compuesta. |
+| Sin segunda oportunidad si los chunks no sirven. | Si el resultado no le basta, el LLM puede **volver a buscar** con otras palabras (hasta `MAX_ITERACIONES`). |
+| Ampliarlo exige programar `if` a mano. | Basta con escribir otra función `@tool` y añadirla a la lista de `crear_tools()`. El LLM decide cuándo usarla. |
+| Reindexa los PDFs en cada ejecución. | Abre la base existente con `cargar_vector_store()` y solo la crea si la carpeta `db/` no existe. |
+
+### Lo que cuesta usar tools
+
+Las tools no son gratis. Conviene conocer sus inconvenientes:
+
+- **Más llamadas al LLM.** Una pregunta que necesita búsqueda hace **al menos 2 llamadas**: una para pedir la tool y otra para responder. El RAG básico hace solo 1. Esto supone más latencia y más *tokens*.
+- **El modelo puede equivocarse al decidir.** Podría no buscar cuando debería y responder con su conocimiento general. Por eso el `SYSTEM_PROMPT` insiste en responder **únicamente** con la información de la herramienta.
+- **Necesita un modelo con soporte de *tool calling*.** No todos los LLM lo tienen. El modelo usado aquí, `openai/gpt-oss-20b` en Groq, sí lo tiene.
+
+---
+
+## 6. Cómo ampliarlo con otra tool
+
+Como el bucle de `responder()` ejecuta cualquier herramienta por su nombre, añadir una nueva solo requiere definirla dentro de `crear_tools()` e incluirla en la lista. Por ejemplo, una herramienta para saber qué documentos hay en la base:
+
+```python
+@tool
+def listar_documentos() -> str:
+    """Devuelve la lista de reglamentos disponibles en la base de conocimientos.
+    Úsala cuando el usuario pregunte qué documentos o reglamentos se pueden consultar."""
+    fuentes = {m["source"] for m in vector_store.get(include=["metadatas"])["metadatas"]}
+    return "\n".join(sorted(fuentes))
+
+return [buscar_reglamentos, listar_documentos]
+```
+
+También se podría añadir `nota_final_kl` de `tools.py`. El asistente buscaría en los reglamentos cuando le pregunten por normas y calcularía la nota cuando le den las calificaciones de los parciales. Como el contenido de un `ToolMessage` debe ser texto, en ese caso la tool debería devolver `str` o el bucle convertir el resultado con `str(resultado)`.
+
+---
+
+## 7. Cómo ejecutarlo
+
+### Requisitos
+
+Con el entorno virtual activado:
+
+```bash
+pip install -r requirements.txt
+```
+
+[requirements.txt](requirements.txt) solo incluye las dependencias que el código usa directamente, agrupadas por etapa del RAG; pip instala el resto automáticamente. Dos de ellas no se importan en el código pero son necesarias:
+
+- `cryptography`: para leer PDFs cifrados con AES.
+- `sentence-transformers`: lo usa `HuggingFaceEmbeddings` por debajo para cargar el modelo de embeddings.
+
+El `torch` que se instala es la versión para CPU. Para usar una GPU NVIDIA, instala la versión con CUDA siguiendo las instrucciones de [pytorch.org](https://pytorch.org/get-started/locally/).
+
+### Archivo `.env`
+
+```
+GROQ_API_KEY=gsk_...                       # clave de https://console.groq.com
+LLM_MODEL=openai/gpt-oss-20b               # modelo de Groq (debe admitir tool calling)
+EMBEDDINGS_MODEL=BAAI/bge-base-en-v1.5     # modelo de embeddings de Hugging Face
+PERSIST_DIR=./db                           # carpeta de la base vectorial
+HF_TOKEN=hf_...                            # opcional: descargas más rápidas desde Hugging Face
+```
+
+El `.env` contiene claves privadas y está excluido en el `.gitignore`. **No lo subas al repositorio.**
+
+### Ejecutar
+
+```bash
+python tools.py            # paso 1: introducción a las tools
+python rag_basico.py       # paso 2: RAG sin tools
+python rag_con_tools.py    # paso 3: RAG con tools
+```
+
+En los dos scripts de RAG, escribe `salir` para terminar.
+
+> **Si cambias los PDFs o el modelo de embeddings**, borra la carpeta `db/` para que `rag_con_tools.py` vuelva a crear la base vectorial. Una base creada con un modelo de embeddings no sirve para otro.
+
