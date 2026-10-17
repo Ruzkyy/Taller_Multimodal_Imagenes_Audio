@@ -328,12 +328,6 @@ Con el entorno virtual activado:
 pip install -r requirements.txt
 ```
 
-[requirements.txt](requirements.txt) solo incluye las dependencias que el código usa directamente, agrupadas por etapa del RAG; pip instala el resto automáticamente. Dos de ellas no se importan en el código pero son necesarias:
-
-- `cryptography`: para leer PDFs cifrados con AES.
-- `sentence-transformers`: lo usa `HuggingFaceEmbeddings` por debajo para cargar el modelo de embeddings.
-
-El `torch` que se instala es la versión para CPU. Para usar una GPU NVIDIA, instala la versión con CUDA siguiendo las instrucciones de [pytorch.org](https://pytorch.org/get-started/locally/).
 
 ### Archivo `.env`
 
