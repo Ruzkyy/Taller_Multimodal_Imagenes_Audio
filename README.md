@@ -8,6 +8,15 @@ Este proyecto enseña en tres pasos cómo un LLM puede usar herramientas (*tools
 | 2 | [rag_basico.py](rag_basico.py) | RAG clásico: **siempre** busca en la base vectorial y mete el resultado en el prompt. |
 | 3 | [rag_con_tools.py](rag_con_tools.py) | RAG con *tools*: la búsqueda es una **herramienta** y **el LLM decide** cuándo y cómo usarla. |
 
+Después se amplía el uso del LLM en dos direcciones: información actualizada y entradas que no son texto.
+
+| Paso | Archivo | Qué muestra |
+|---|---|---|
+| 4 | [web_search.py](web_search.py) | La **fecha de corte**: el modelo no conoce hechos recientes y responde con datos desactualizados. |
+| 5 | [web_search_2.py](web_search_2.py) | La solución: una *tool* de **búsqueda web** (Tavily) para responder sobre hechos actuales. |
+| 6 | [multimodal.py](multimodal.py) | Entrada **multimodal**: el LLM recibe una imagen y la describe. |
+| 7 | [audio_input.py](audio_input.py) | Entrada de **audio**: se graba la voz, se transcribe con Whisper y el LLM responde. |
+
 ---
 
 ## 1. Estructura del proyecto
@@ -15,6 +24,7 @@ Este proyecto enseña en tres pasos cómo un LLM puede usar herramientas (*tools
 ```
 RAG/
 ├── pdfs/                  # Documentos fuente (reglamentos)
+├── imagenes/              # Imágenes .png para multimodal.py
 ├── db/                    # Base vectorial ChromaDB (se genera automáticamente)
 ├── utils/
 │   ├── load_documents.py  # cargar_pdfs()              → lee los PDFs (un Document por página)
@@ -26,6 +36,10 @@ RAG/
 ├── tools.py               # Paso 1: introducción a las tools
 ├── rag_basico.py          # Paso 2: RAG sin tools
 ├── rag_con_tools.py       # Paso 3: RAG con tools
+├── web_search.py          # Paso 4: limitación de la fecha de corte
+├── web_search_2.py        # Paso 5: tool de búsqueda web
+├── multimodal.py          # Paso 6: entrada de imagen
+├── audio_input.py         # Paso 7: entrada de audio
 └── .env                   # Configuración y claves (no se sube a git)
 ```
 
@@ -318,7 +332,247 @@ También se podría añadir `nota_final_kl` de `tools.py`. El asistente buscarí
 
 ---
 
-## 7. Cómo ejecutarlo
+## 7. La fecha de corte: `web_search.py`
+
+Un LLM solo sabe lo que vio durante su entrenamiento. Esa información termina en una **fecha de corte** (*knowledge cutoff*). Si se le pregunta por algo posterior, el modelo no puede saberlo, pero casi nunca lo dice: responde con lo último que conoce como si fuera actual.
+
+`web_search.py` hace una pregunta sobre un hecho actual y muestra el razonamiento del modelo, su respuesta y los tokens usados:
+
+```python
+llm_model = cargar_llm(max_tokens=4096, reasoning_effort="low")
+
+respuesta = llm_model.invoke("¿Quién es el presidente de Colombia?")
+
+print(respuesta.additional_kwargs.get("reasoning_content"))   # razonamiento del modelo
+print(respuesta.content)                                        # respuesta final
+print(respuesta.response_metadata.get("finish_reason"))         # por qué terminó
+```
+
+Salida real (27 de octubre de 2026):
+
+```
+Razonamiento del modelo:
+Need current president. As of 2026, president is Gustavo Petro? Actually Petro was president
+2022-2026. In 2026, new president likely Gustavo Petro still until 2026? ... So answer: Gustavo Petro.
+
+Respuesta: El presidente de Colombia es **Gustavo Petro**.
+```
+
+En su propio razonamiento, el modelo reconoce que el mandato de Petro termina en 2026. Aun así responde con el último dato que conoce y no advierte que puede estar desactualizado.
+
+### El razonamiento y los tokens
+
+`openai/gpt-oss-20b` es un **modelo de razonamiento**: antes de responder, "piensa" en un texto aparte. LangChain lo guarda en `respuesta.additional_kwargs["reasoning_content"]`, no en `content`. `respuesta` es un `AIMessage`.
+
+Ese razonamiento también consume *tokens* de salida.  Por eso `cargar_llm` recibe dos parámetros adicionales:
+
+- `max_tokens=4096`: deja margen para la respuesta.
+- `reasoning_effort="low"`: le pide al modelo razonar menos.
+
+---
+
+## 8. Búsqueda web como tool: `web_search_2.py`
+
+La solución a la fecha de corte es darle al modelo una herramienta para consultar información actual. Es el mismo patrón de las secciones 2 y 4: una función `@tool`, `bind_tools` y el ciclo de petición, ejecución y respuesta.
+
+### La tool
+
+La búsqueda la hace [Tavily](https://tavily.com), un buscador pensado para LLM. Devuelve los resultados ya resumidos (`include_answer='basic'`) junto con las fuentes:
+
+```python
+from tavily import TavilyClient
+
+tavily_client = TavilyClient()   # lee TAVILY_API_KEY del .env
+
+@tool
+def web_search(query: str) -> Dict[str, Any]:
+    """Search the web for information"""
+    return tavily_client.search(
+        query=query,
+        include_answer='basic',
+        max_results=5,
+        start_date="2026-01-27",
+        end_date="2026-10-27"
+    )
+```
+
+Igual que con `nota_final_kl`, conviene probar la tool sola antes de dársela al LLM:
+
+```python
+respuesta = web_search.invoke("¿Quién ganó el balón de oro en 2026?")
+print(respuesta.get("answer"))
+```
+
+### Dos errores comunes
+
+**1. Solo usar `bind_tools`.** `bind_tools` le dice al modelo que la herramienta existe, pero no la ejecuta. Si el programa solo llama a `invoke` una vez, el LLM pide la búsqueda en `tool_calls` y nadie la hace. Hay que completar los tres pasos:
+
+```python
+# 1. Enviar la pregunta: el LLM responde pidiendo la tool (tool_calls)
+mensajes = [SystemMessage(SYSTEM_PROMPT), HumanMessage(pregunta)]
+respuesta = llm_model.invoke(mensajes)
+mensajes.append(respuesta)
+
+# 2. Ejecutar cada tool pedida y devolver el resultado con un ToolMessage
+for tool_call in respuesta.tool_calls:
+    resultado = web_search.invoke(tool_call["args"])
+    mensajes.append(ToolMessage(content=str(resultado), tool_call_id=tool_call["id"]))
+
+# 3. Volver a llamar al LLM con el resultado para que redacte la respuesta final
+respuesta_final = llm_model.invoke(mensajes)
+```
+
+**2. No decirle al modelo que busque.** El modelo "cree" saber quién es el presidente, así que puede responder directamente sin usar la herramienta. El `SystemMessage` le da la fecha de hoy y le indica que use la búsqueda para hechos actuales:
+
+```python
+SYSTEM_PROMPT = (
+    f"Hoy es {date.today()}. Tu conocimiento tiene una fecha de corte anterior, "
+    "así que para cualquier pregunta sobre hechos actuales o recientes usa siempre "
+    "la herramienta web_search antes de responder."
+)
+```
+
+### Resultado
+
+Salida real con la misma pregunta de la sección 7:
+
+```
+Petición del LLM: [{'name': 'web_search', 'args': {'query': 'presidente de Colombia 2026'}, ...}]
+Resultado de la tool: According to the sources, Abelardo de la Espriella is the president of
+                      Colombia as of 2026. He was inaugurated on August 7, 2026, ...
+
+Respuesta: El presidente de Colombia es **Abelardo de la Espriella**.
+Fue proclamado presidente electo el 24 de junio de 2026 y asumió el cargo el 7 de agosto de 2026,
+sucediendo a Gustavo Petro. Su mandato cubre el período 2026-2030.
+```
+
+Fíjate en que el LLM **redactó su propia consulta** (*"presidente de Colombia 2026"*), igual que con `buscar_reglamentos`.
+
+| | `web_search.py` (sin tool) | `web_search_2.py` (con tool) |
+|---|---|---|
+| Respuesta | Gustavo Petro (desactualizada) | Abelardo de la Espriella (correcta) |
+| Llamadas al LLM | 1 | 2 |
+| Tokens de entrada | 79 | 3577 |
+
+La búsqueda da la respuesta correcta, pero cuesta más: el resultado completo de Tavily entra al contexto del modelo.
+
+> **Buscar en los reglamentos y buscar en la web es el mismo patrón.** En la sección 4 la tool consulta una base vectorial con documentos propios; aquí consulta internet. En los dos casos, el LLM decide cuándo buscar y con qué texto.
+
+---
+
+## 9. Entrada multimodal (imagen): `multimodal.py`
+
+Un modelo **multimodal** puede recibir otros tipos de datos además de texto. `multimodal.py` envía una imagen y le pide al modelo que la analice.
+
+### Elegir la imagen
+
+El script lista las imágenes `.png` de la carpeta `imagenes/` y pide el número de la que se quiere usar:
+
+```python
+CARPETA_IMAGENES = Path(__file__).parent / "imagenes"
+
+imagenes = sorted(CARPETA_IMAGENES.glob("*.png"))
+for i, imagen in enumerate(imagenes, start=1):
+    print(f"{i}. {imagen.name}")
+
+ruta = imagenes[int(input("Número de la imagen: ")) - 1]
+imagen_bytes = ruta.read_bytes()
+```
+
+
+### Enviar la imagen
+
+La imagen se convierte a **base64** (texto) y se envía en el mismo `HumanMessage` que la pregunta. En lugar de un texto, `content` es una **lista de bloques**: uno de texto y uno de imagen.
+
+```python
+img_b64 = base64.b64encode(imagen_bytes).decode("utf-8")
+
+llm_model = cargar_llm(model_name="qwen/qwen3.8-27b", max_tokens=4096, reasoning_effort="low")
+
+multimodal_question = HumanMessage(content=[
+    {"type": "text", "text": "¿Que alimentos hay en esta imagen?"},
+    {"type": "image", "base64": img_b64, "mime_type": "image/png"}
+])
+
+response = llm_model.invoke([multimodal_question])
+print(response.content)
+```
+
+Con una foto del interior de una nevera, el modelo responde:
+
+```
+La imagen muestra el interior de un **refrigerador (nevera) muy ordenado y bien surtido**, ...
+```
+
+### Errores comunes
+
+- **No todos los modelos ven imágenes.** `openai/gpt-oss-20b` solo recibe texto. Por eso este script usa un modelo con visión, `qwen/qwen3.8-27b`, pasándolo en `model_name` sin cambiar el `.env`.
+
+- **La respuesta es un `AIMessage`**: el texto se lee con `response.content`.
+
+---
+
+## 10. Entrada de audio: `audio_input.py`
+
+`audio_input.py` graba la voz del usuario, la reproduce y le pide al LLM que responda a lo que se dijo.
+
+### Grabar y reproducir
+
+La librería `sounddevice` usa el micrófono y los altavoces del computador:
+
+```python
+duration = 5        # segundos
+sample_rate = 44100 # muestras por segundo
+
+audio = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1)
+sd.wait()                                   # esperar a que termine la grabación
+
+sd.play(audio, samplerate=sample_rate)      # reproducir lo grabado
+sd.wait()
+```
+
+`sd.rec` devuelve el audio como un arreglo de NumPy. Para enviarlo a un modelo, se convierte a un archivo **WAV en memoria**, sin guardarlo en disco:
+
+```python
+buf = io.BytesIO()
+write(buf, sample_rate, audio)
+wav_bytes = buf.getvalue()
+```
+
+> En Windows, el permiso del micrófono debe estar activado en *Configuración → Privacidad y seguridad → Micrófono*, incluido *"Permitir que las aplicaciones de escritorio accedan al micrófono"*. Si no lo está, se graba silencio sin ningún error.
+
+### Del audio al texto con Whisper
+
+Los modelos de chat de Groq aceptan texto e imágenes, pero **no audio**. Enviar el audio como un bloque `"image"` da `invalid image data`, y como bloque `"audio"` Groq también lo rechaza.
+
+La solución es encadenar dos modelos:
+
+```
+voz ──► micrófono ──► WAV ──► Whisper (voz a texto) ──► transcripción ──► LLM ──► respuesta
+```
+
+```python
+from groq import Groq
+
+transcripcion = Groq().audio.transcriptions.create(
+    file=("grabacion.wav", wav_bytes),
+    model="whisper-large-v3-turbo",
+    language="es",
+)
+print(f"Transcripción: {transcripcion.text}")
+
+response = llm_model.invoke([HumanMessage(f"{transcripcion.text}")])
+print(response.content)
+```
+
+- **Whisper** es un modelo especializado en transcribir voz. Groq lo ofrece con la misma `GROQ_API_KEY`.
+- La librería `groq` ya viene instalada como dependencia de `langchain-groq`.
+
+> **"Multimodal" depende del modelo.** `qwen/qwen3.8-27b` acepta imágenes pero no audio. Cuando un modelo no admite un tipo de dato, se puede encadenar con otro modelo que lo convierta a algo que sí acepte: en este caso, voz a texto.
+
+---
+
+## 11. Cómo ejecutarlo
 
 ### Requisitos
 
@@ -334,6 +588,7 @@ pip install -r requirements.txt
 ```
 GROQ_API_KEY=gsk_...                       # clave de https://console.groq.com
 LLM_MODEL=openai/gpt-oss-20b               # modelo de Groq (debe admitir tool calling)
+TAVILY_API_KEY=tvly-...                    # clave de https://tavily.com (para web_search_2.py)
 EMBEDDINGS_MODEL=BAAI/bge-base-en-v1.5     # modelo de embeddings de Hugging Face
 PERSIST_DIR=./db                           # carpeta de la base vectorial
 HF_TOKEN=hf_...                            # opcional: descargas más rápidas desde Hugging Face
@@ -347,6 +602,10 @@ El `.env` contiene claves privadas y está excluido en el `.gitignore`. **No lo 
 python tools.py            # paso 1: introducción a las tools
 python rag_basico.py       # paso 2: RAG sin tools
 python rag_con_tools.py    # paso 3: RAG con tools
+python web_search.py       # paso 4: limitación de la fecha de corte
+python web_search_2.py     # paso 5: búsqueda web como tool
+python multimodal.py       # paso 6: análisis de una imagen de imagenes/
+python audio_input.py      # paso 7: grabar, transcribir y responder
 ```
 
 En los dos scripts de RAG, escribe `salir` para terminar.

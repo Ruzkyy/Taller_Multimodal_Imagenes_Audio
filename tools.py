@@ -18,17 +18,17 @@ def nota_final_kl(parcial1: float, parcial2: float) -> float:
     """
     return parcial1 * 0.4 + parcial2 * 0.6
 
-# prueba de la tool
-nota_final = nota_final_kl.invoke({"parcial1": 3.5, "parcial2": 4.0})
+# # prueba de la tool
+# nota_final = nota_final_kl.invoke({"parcial1": 3.5, "parcial2": 4.0})
 
-print(f"Nota final: {nota_final}")
+# print(f"Nota final: {nota_final}")
 
-llm_model = cargar_llm()
+# llm_model = cargar_llm()
 
-pregunta = "Responde en una frase: ¿qué es un sistema RAG?"
+# pregunta = "Responde en una frase: ¿qué es un sistema RAG?"
 
-respuesta = llm_model.invoke(pregunta)
-print(f"Respuesta: {respuesta.content}")
+# respuesta = llm_model.invoke(pregunta)
+# print(f"Respuesta: {respuesta.content}")
 
 # Usar la tool desde el LLM
 pregunta_tool = "Calcula la nota final de un estudiante que obtuvo 3.5 en el primer parcial y 4.0 en el segundo parcial."

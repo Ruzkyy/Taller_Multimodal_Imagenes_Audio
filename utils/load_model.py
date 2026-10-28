@@ -7,12 +7,13 @@ load_dotenv()
 MODELO_LLM = os.getenv("LLM_MODEL", "openai/gpt-oss-20b")
 
 
-def cargar_llm(model_name=None, temperature=0):
+def cargar_llm(model_name=None, temperature=0, **kwargs):
     """Carga un modelo LLM de Groq a través de LangChain.
 
     Args:
         model_name: nombre del modelo en Groq (por defecto, LLM_MODEL del .env).
         temperature: 0 da respuestas más precisas y repetibles; valores altos, más creativas.
+        **kwargs: parámetros adicionales de ChatGroq (p. ej. max_tokens, reasoning_effort).
 
     Returns:
         Objeto ChatGroq con el método invoke para enviar mensajes.
@@ -23,6 +24,7 @@ def cargar_llm(model_name=None, temperature=0):
     return ChatGroq(
         model=model_name or MODELO_LLM,
         temperature=temperature,
+        **kwargs,
     )
 
 
