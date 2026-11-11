@@ -1,14 +1,31 @@
+from datetime import date
 import sounddevice as sd
 from scipy.io.wavfile import write
 import io
 import time
 from tqdm import tqdm
+from dotenv import load_dotenv
 from utils.load_model import cargar_llm
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import tool
 from groq import Groq
+from tavily import TavilyClient
+from typing import Any, Dict
 
-# Graba 5 segundos de audio desde el micrófono
-duration = 5  # seconds
+load_dotenv()
+
+
+@tool
+def web_search(query: str) -> Dict[str, Any]:
+    """Busca en la web hechos actuales, cifras recientes y récords que puedan haber cambiado.
+
+    Args:
+        query: Pregunta concreta para buscar información y fuentes actuales.
+    """
+    return TavilyClient().search(query=query, include_answer="basic", max_results=5)
+
+# Graba 20 segundos de audio desde el micrófono
+duration = 20  # seconds
 sample_rate = 44100
 
 print("Recording...")
@@ -38,10 +55,30 @@ transcripcion = Groq().audio.transcriptions.create(
 )
 print(f"Transcripción: {transcripcion.text}")
 
-llm_model = cargar_llm(model_name="qwen/qwen3.8-27b", max_tokens=4096, reasoning_effort="low")
+llm_model = cargar_llm(max_tokens=4096, reasoning_effort="low")
+llm_model_con_busqueda = llm_model.bind_tools([web_search])
 
-response = llm_model.invoke([
-    HumanMessage(f"{transcripcion.text}")
-])
+system_prompt = (
+    f"Hoy es {date.today()}. Para preguntas sobre hechos actuales, cifras recientes "
+    "o récords que puedan haber cambiado, usa siempre web_search antes de responder. "
+    "Basa la respuesta en los resultados y menciona las fuentes disponibles. "
+    "Si la búsqueda no aporta datos fiables o suficientes, dilo claramente."
+)
+mensajes = [
+    SystemMessage(content=system_prompt),
+    HumanMessage(content=transcripcion.text),
+]
+response = llm_model_con_busqueda.invoke(mensajes)
+
+while response.tool_calls:
+    mensajes.append(response)
+    for tool_call in response.tool_calls:
+        if tool_call["name"] != web_search.name:
+            raise RuntimeError(f"Herramienta no soportada: {tool_call['name']}")
+        resultado = web_search.invoke(tool_call["args"])
+        mensajes.append(
+            ToolMessage(content=str(resultado), tool_call_id=tool_call["id"])
+        )
+    response = llm_model_con_busqueda.invoke(mensajes)
 
 print(response.content)
